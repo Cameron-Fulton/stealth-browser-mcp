@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import nodriver as uc
 from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
+from mcp.types import ImageContent, TextContent
 from pydantic_core import to_json
 
 from browser_manager import BrowserManager
@@ -798,7 +800,7 @@ async def take_screenshot(
     full_page: bool = False,
     format: str = "png",
     file_path: Optional[str] = None
-) -> Union[str, Dict[str, Any]]:
+) -> Union[str, ToolResult]:
     """
     Take a screenshot of the page.
 
@@ -809,9 +811,12 @@ async def take_screenshot(
         file_path (Optional[str]): Optional file path to save screenshot to.
 
     Returns:
-        Union[str, Dict]: File path if file_path provided, otherwise optimized base64 data or file info dict.
+        Union[str, ToolResult]: Explicit server-local file export, or an MCP image
+            with format, dimensions and SHA-256 metadata. Inline images are limited
+            to 8 MiB; use file_path for larger exports.
     """
     from PIL import Image
+    import hashlib
     import io
 
     format = format.lower()
@@ -828,15 +833,19 @@ async def take_screenshot(
         save_path = Path(file_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         await tab.save_screenshot(save_path, format=format, full_page=full_page)
-        return f"Screenshot saved. AI agents should use the Read tool to view this image: {str(save_path.absolute())}"
+        return f"Screenshot saved on the server: {str(save_path.absolute())}"
     
     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
         tmp_path = Path(tmp_file.name)
     
     try:
         await tab.save_screenshot(tmp_path, format=format, full_page=full_page)
+        if tmp_path.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError("Screenshot exceeds inline capture limit; use file_path for export.")
         
         with Image.open(tmp_path) as img:
+            if img.width * img.height > 16 * 1024 * 1024:
+                raise ValueError("Screenshot dimensions exceed inline limit; use file_path.")
             if img.mode in ('RGBA', 'LA', 'P') and format.lower() == 'jpeg':
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 if img.mode == 'P':
@@ -853,28 +862,24 @@ async def take_screenshot(
             
             compressed_bytes = output_buffer.getvalue()
             
-            base64_size = len(compressed_bytes) * 1.33
-            estimated_tokens = int(base64_size / 4)
-            
-            if estimated_tokens > 20000:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                screenshot_filename = f"screenshot_{timestamp}_{instance_id[:8]}.{format.lower()}"
-                screenshot_path = response_handler.clone_dir / screenshot_filename
-                
-                with open(screenshot_path, 'wb') as f:
-                    f.write(compressed_bytes)
-                
-                file_size_kb = len(compressed_bytes) / 1024
-                return {
-                    "file_path": str(screenshot_path),
-                    "filename": screenshot_filename,
-                    "file_size_kb": round(file_size_kb, 2),
-                    "estimated_tokens": estimated_tokens,
-                    "reason": "Screenshot too large, automatically saved to file",
-                    "message": f"Screenshot saved. AI agents should use the Read tool to view this image: {str(screenshot_path)}"
-                }
-            
-            return base64.b64encode(compressed_bytes).decode('utf-8')
+            if len(compressed_bytes) > 8 * 1024 * 1024:
+                raise ValueError("Screenshot exceeds 8 MiB inline limit; use file_path for export.")
+            metadata = {
+                "format": format,
+                "width": img.width,
+                "height": img.height,
+                "bytes": len(compressed_bytes),
+                "sha256": hashlib.sha256(compressed_bytes).hexdigest(),
+                "complete": True,
+            }
+            return ToolResult(
+                content=[ImageContent(
+                    type="image",
+                    mimeType=f"image/{format}",
+                    data=base64.b64encode(compressed_bytes).decode("ascii"),
+                ), TextContent(type="text", text=json.dumps(metadata))],
+                structured_content=metadata,
+            )
             
     finally:
         if tmp_path.exists():

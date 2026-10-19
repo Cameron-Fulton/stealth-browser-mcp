@@ -352,6 +352,26 @@ client = Client(
 | `get_page_content()` | Read page HTML and text |
 | `take_screenshot()` | Capture screenshots |
 
+`take_screenshot` returns an MCP image block by default, with the correct PNG/JPEG
+MIME type and structured dimensions, byte count and SHA-256 metadata. Remote MCP
+clients can display the image without reading the server's filesystem. Inline
+images are complete and limited to 8 MiB after compression (16 MiB capture bytes
+and 16 megapixels before encoding); larger captures fail with an explicit export
+instruction instead of silently returning an inaccessible local path. For an
+explicit server-local export, pass `file_path`. This still saves the requested
+file and returns its location; making that exported file accessible to a remote
+client remains the caller's responsibility.
+
+The 8 MiB binary limit becomes about 10.67 MiB of base64, plus JSON metadata,
+on the wire; client-specific message limits may be lower.
+
+This intentionally replaces the previous inline base64 text and automatic local
+file fallback. Metadata is also included as a small text block for clients without
+structured-result support. `complete` describes the returned image bytes, not page
+readiness or full-page coverage. Limits apply after browser capture and before
+Pillow decoding/inline encoding; they are not browser/CDP memory budgets. File
+export still captures the image in the browser and is not a low-memory alternative.
+
 </details>
 
 <details>
