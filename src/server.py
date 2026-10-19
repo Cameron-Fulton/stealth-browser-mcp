@@ -10,7 +10,6 @@ import sys
 import tempfile
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -39,6 +38,7 @@ from dynamic_hook_ai_interface import dynamic_hook_ai
 from persistent_storage import persistent_storage
 from progressive_element_cloner import progressive_element_cloner
 from response_handler import response_handler
+from screenshot_encoder import DEFAULT_QUALITY, fit_screenshot, validate_options as validate_screenshot_options
 from stdio_guard import install_stdio_guard
 from platform_utils import validate_browser_environment, get_platform_info
 from process_cleanup import process_cleanup
@@ -799,31 +799,32 @@ async def take_screenshot(
     instance_id: str,
     full_page: bool = False,
     format: str = "png",
-    file_path: Optional[str] = None
+    file_path: Optional[str] = None,
+    quality: int = DEFAULT_QUALITY,
+    max_width: Optional[int] = None
 ) -> Union[str, ToolResult]:
     """
     Take a screenshot of the page.
 
+    The image is returned as MCP image content with metadata. It is scaled
+    down, keeping its aspect ratio, when it is wider than max_width, longer
+    than 8000 pixels on a side, or too large to send inline. The metadata
+    reports the original size and the scale used.
+
     Args:
         instance_id (str): Browser instance ID.
         full_page (bool): Capture full page (not just viewport).
-        format (str): Image format ('png' or 'jpeg').
-        file_path (Optional[str]): Optional file path to save screenshot to.
+        format (str): Image format ('png' or 'jpeg'). Use jpeg with a lower quality for smaller images.
+        file_path (Optional[str]): Save the full-resolution screenshot to this path on the server instead.
+        quality (int): JPEG quality from 1 to 100. PNG is lossless and ignores it.
+        max_width (Optional[int]): Largest width in pixels to return, for a smaller image.
 
     Returns:
-        Union[str, ToolResult]: Explicit server-local file export, or an MCP image
-            with format, dimensions and SHA-256 metadata. Inline images are limited
-            to 8 MiB; use file_path for larger exports.
+        Union[str, ToolResult]: Server file location when file_path is given, otherwise
+            an MCP image with format, width, height, original size, scale, quality,
+            byte count, and SHA-256 metadata.
     """
-    from PIL import Image
-    import hashlib
-    import io
-
-    format = format.lower()
-    if format == "jpg":
-        format = "jpeg"
-    if format not in ("png", "jpeg"):
-        raise ValueError(f"Unsupported screenshot format: {format}. Use 'png' or 'jpeg'.")
+    format = validate_screenshot_options(format, quality, max_width)
 
     tab = await browser_manager.get_tab(instance_id)
     if not tab:
@@ -834,53 +835,21 @@ async def take_screenshot(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         await tab.save_screenshot(save_path, format=format, full_page=full_page)
         return f"Screenshot saved on the server: {str(save_path.absolute())}"
-    
+
     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
         tmp_path = Path(tmp_file.name)
-    
+
     try:
-        await tab.save_screenshot(tmp_path, format=format, full_page=full_page)
-        if tmp_path.stat().st_size > 16 * 1024 * 1024:
-            raise ValueError("Screenshot exceeds inline capture limit; use file_path for export.")
-        
-        with Image.open(tmp_path) as img:
-            if img.width * img.height > 16 * 1024 * 1024:
-                raise ValueError("Screenshot dimensions exceed inline limit; use file_path.")
-            if img.mode in ('RGBA', 'LA', 'P') and format.lower() == 'jpeg':
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                if img.mode == 'P':
-                    img = img.convert('RGBA')
-                background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
-                img = background
-            
-            output_buffer = io.BytesIO()
-            
-            if format.lower() == 'jpeg':
-                img.save(output_buffer, format='JPEG', quality=85, optimize=True)
-            else:
-                img.save(output_buffer, format='PNG', optimize=True)
-            
-            compressed_bytes = output_buffer.getvalue()
-            
-            if len(compressed_bytes) > 8 * 1024 * 1024:
-                raise ValueError("Screenshot exceeds 8 MiB inline limit; use file_path for export.")
-            metadata = {
-                "format": format,
-                "width": img.width,
-                "height": img.height,
-                "bytes": len(compressed_bytes),
-                "sha256": hashlib.sha256(compressed_bytes).hexdigest(),
-                "complete": True,
-            }
-            return ToolResult(
-                content=[ImageContent(
-                    type="image",
-                    mimeType=f"image/{format}",
-                    data=base64.b64encode(compressed_bytes).decode("ascii"),
-                ), TextContent(type="text", text=json.dumps(metadata))],
-                structured_content=metadata,
-            )
-            
+        await tab.save_screenshot(tmp_path, format="png", full_page=full_page)
+        image_bytes, metadata = fit_screenshot(tmp_path, format, quality, max_width)
+        return ToolResult(
+            content=[ImageContent(
+                type="image",
+                mimeType=f"image/{format}",
+                data=base64.b64encode(image_bytes).decode("ascii"),
+            ), TextContent(type="text", text=json.dumps(metadata))],
+            structured_content=metadata,
+        )
     finally:
         if tmp_path.exists():
             os.unlink(tmp_path)

@@ -23,6 +23,10 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+import screenshot_encoder
+from screenshot_encoder import DEFAULT_QUALITY, fit_screenshot, validate_options
 
 
 class ScreenshotContentTests(unittest.TestCase):
@@ -63,7 +67,8 @@ class ScreenshotContentTests(unittest.TestCase):
             __name__="screenshot_test", section_tool=lambda _: mcp.tool,
             browser_manager=Manager(), Path=Path, Optional=Optional, Union=Union,
             ToolResult=ToolResult, ImageContent=ImageContent, TextContent=TextContent,
-            tempfile=tempfile, os=os, base64=base64, json=json,
+            tempfile=tempfile, os=os, base64=base64, json=json, DEFAULT_QUALITY=DEFAULT_QUALITY,
+            fit_screenshot=fit_screenshot, validate_screenshot_options=validate_options,
         )
         exec(compile(ast.Module(body=[function], type_ignores=[]), str(ROOT / "src/server.py"), "exec"), namespace)
         return mcp
@@ -131,9 +136,10 @@ class ScreenshotContentTests(unittest.TestCase):
                 return await client.call_tool("take_screenshot", {"instance_id": "owned"})
         result = asyncio.run(run())
         image = base64.b64decode(result.content[0].data, validate=True)
-        self.assertGreater(len(image), 8 * 1024 * 1024 * .98)
-        self.assertLessEqual(len(image), 8 * 1024 * 1024)
-        self.assertEqual(Image.open(io.BytesIO(image)).size, (1660, 1660))
+        self.assertGreater(len(image), screenshot_encoder.INLINE_MAX_BYTES * .9)
+        self.assertLessEqual(len(image), screenshot_encoder.INLINE_MAX_BYTES)
+        self.assertEqual(Image.open(io.BytesIO(image)).size, (1100, 1100))
+        self.assertEqual(result.structured_content["scale"], 1.0)
         self.assertEqual(result.structured_content["sha256"], hashlib.sha256(image).hexdigest())
 
     def test_explicit_file_export_stays_available(self):
@@ -149,8 +155,9 @@ class ScreenshotContentTests(unittest.TestCase):
         self.assertEqual(self.captures, [])
 
     def test_oversized_capture_fails_and_removes_temporary_file(self):
-        self.png = b"x" * (16 * 1024 * 1024 + 1)
-        result = self.call()
+        self.png = b"x" * 2048
+        with patch.object(screenshot_encoder, "MAX_CAPTURE_BYTES", 1024):
+            result = self.call()
         self.assertTrue(result.isError)
         self.assertIn("inline capture limit", result.content[0].text)
         self.assertFalse(self.captures[0][0].exists())
@@ -158,9 +165,10 @@ class ScreenshotContentTests(unittest.TestCase):
     def test_excessive_pixels_are_rejected_before_decode(self):
         header = self.png[12:16] + struct.pack(">II", 4097, 4097) + self.png[24:29]
         self.png = self.png[:12] + header + struct.pack(">I", zlib.crc32(header)) + self.png[33:]
-        result = self.call()
+        with patch.object(screenshot_encoder, "MAX_DECODE_PIXELS", 16 * 1024 * 1024):
+            result = self.call()
         self.assertTrue(result.isError)
-        self.assertIn("dimensions exceed inline limit", result.content[0].text)
+        self.assertIn("dimensions exceed the decode limit", result.content[0].text)
         self.assertFalse(self.captures[0][0].exists())
 
     def test_capture_failure_removes_temporary_file(self):
@@ -184,9 +192,56 @@ class ScreenshotContentTests(unittest.TestCase):
         # A synthetic encoder result tests the precise post-compression boundary.
         # Input remains a valid small capture; only output encoding is mocked.
         self.png = ScreenshotContentTests.small_png()
-        with patch.object(Image.Image, "save", lambda _, stream, **kw: stream.write(b"x" * (8 * 1024 * 1024 + 1))):
-            self.assertTrue(self.call().isError)
+        oversized = b"x" * (screenshot_encoder.INLINE_MAX_BYTES + 1)
+        with patch.object(Image.Image, "save", lambda _, stream, **kw: stream.write(oversized)):
+            result = self.call()
+        self.assertTrue(result.isError)
+        self.assertIn("could not be reduced", result.content[0].text)
         self.assertFalse(self.captures[0][0].exists())
+
+    def test_tall_full_page_is_scaled_instead_of_failing(self):
+        buffer = io.BytesIO()
+        Image.new("RGB", (400, 20000), (200, 10, 10)).save(buffer, format="PNG")
+        self.png = buffer.getvalue()
+        result = self.call(full_page=True)
+        self.assertFalse(result.isError)
+        meta = result.structuredContent
+        self.assertEqual((meta["width"], meta["height"]), (160, screenshot_encoder.MAX_IMAGE_SIDE))
+        self.assertEqual((meta["original_width"], meta["original_height"]), (400, 20000))
+        self.assertEqual(meta["scale"], 0.4)
+        image = Image.open(io.BytesIO(base64.b64decode(result.content[0].data)))
+        self.assertEqual(image.size, (160, 8000))
+
+    def test_large_encoding_is_scaled_to_fit_byte_limit(self):
+        buffer = io.BytesIO()
+        Image.frombytes("RGB", (600, 600), os.urandom(600 * 600 * 3)).save(buffer, format="PNG")
+        self.png = buffer.getvalue()
+        with patch.object(screenshot_encoder, "INLINE_MAX_BYTES", 300_000):
+            result = self.call()
+        self.assertFalse(result.isError)
+        self.assertLessEqual(result.structuredContent["bytes"], 300_000)
+        self.assertLess(result.structuredContent["scale"], 1.0)
+
+    def test_max_width_and_quality(self):
+        buffer = io.BytesIO()
+        Image.frombytes("RGB", (800, 400), os.urandom(800 * 400 * 3)).save(buffer, format="PNG")
+        self.png = buffer.getvalue()
+        small = self.call(format="jpeg", quality=20, max_width=200).structuredContent
+        large = self.call(format="jpeg", quality=95, max_width=200).structuredContent
+        self.assertEqual((small["width"], small["height"], small["scale"]), (200, 100, 0.25))
+        self.assertEqual((small["quality"], large["quality"]), (20, 95))
+        self.assertLess(small["bytes"], large["bytes"])
+        self.assertIsNone(self.call(format="png").structuredContent["quality"])
+        self.assertEqual(self.call(max_width=5000).structuredContent["scale"], 1.0)
+
+    def test_capture_is_lossless_before_encoding(self):
+        self.call(format="jpeg")
+        self.assertEqual(self.captures[0][1]["format"], "png")
+
+    def test_invalid_quality_or_width_fails_before_capture(self):
+        for options in ({"quality": 0}, {"quality": 101}, {"max_width": 0}):
+            self.assertTrue(self.call(**options).isError, options)
+        self.assertEqual(self.captures, [])
 
     @staticmethod
     def small_png():
@@ -201,7 +256,7 @@ if __name__ == "__main__":
         fixture.setUp()
         if sys.argv[1] == "--serve-large-fixture":
             buffer = io.BytesIO()
-            Image.frombytes("RGB", (1660, 1660), os.urandom(1660 * 1660 * 3)).save(buffer, format="PNG")
+            Image.frombytes("RGB", (1100, 1100), os.urandom(1100 * 1100 * 3)).save(buffer, format="PNG")
             fixture.png = buffer.getvalue()
         try:
             fixture.server().run(show_banner=False)
